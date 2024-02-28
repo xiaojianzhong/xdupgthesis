@@ -1,22 +1,238 @@
 \chapter{涂鸦线标签下基于图相似度传播的弱监督语义分割}
 \section{引言}
-涂鸦线标签
-\section{基于图相似度传播的自然图像弱监督语义分割框架 GAP-CAM}
-\subsection{基于视觉注意力图的分割伪标签初始化策略}
-视觉注意力图
+% 涂鸦线标签
+弱监督语义分割可以由形式各异的多种视觉标签所驱动，不同种类的标签能够为模型训练提供不同量级的信息量，进而得到不同精度水平的语义分割模型。
+其中，涂鸦线标签作为一种简单而又直观的监督标注形式，指的是标注者直接在目标上方绘制一条不规则的涂鸦线条，用于标识该目标的大致位置和所属类别。
+\figureref{fig:scribble-samples}展示了 PASCAL VOC 2012 数据集中三幅图片及它们的涂鸦线标签，其中不同颜色的线条对应不同的目标类别。
+\par
+\begin{figure}[h]
+\centering
+\subfloat[]{\includegraphics[width=.3\linewidth]{scribble-sample-1}%
+\label{scribble-sample-1}}
+\hfil
+\subfloat[]{\includegraphics[width=.3\linewidth]{scribble-sample-2}%
+\label{scribble-sample-2}}
+\hfil
+\subfloat[]{\includegraphics[width=.3\linewidth]{scribble-sample-3}%
+\label{scribble-sample-3}}
+\caption{涂鸦线标签示例}
+\label{fig:scribble-samples}
+\end{figure}
+\par
+% 涂鸦线标签的优势
+相比于图片级的分类标签，涂鸦线标签能够表征出目标的大致位置，对于检测、分割等任务较有帮助。
+相比于像素级的分割标签，涂鸦线标签仅要求标注者在目标上随意画线，无需精准标出目标的所有像素，极大降低了标注成本。
+另外，涂鸦线标签与目标检测任务中的边界框标签具有接近的标注成本，后者仅给出目标的外接矩形，所框定范围并不都是目标像素点，而前者能够提供完全可信的目标像素点，更有利于分割这种像素级任务的训练。
+尽管涂鸦线标签相比于其他标签有诸多优势，在实际应用时，线监督的语义分割目前仍然存在以下两个难点：
+\par
+% 涂鸦线标签的难点
+（1）\textbf{标注的主观性}：
+这是与传统的分类、检测、分割标签最大的不同点。
+对于涂鸦线标签，我们仅要求标注者在目标上方随意画一条线。
+尽管线的粗细可以预设，但其出现位置和覆盖范围都存在很大的随机性。
+对于同一个目标，不同标注者，甚至是同一标注者在不同时间，都会画出完全不一样的标签。
+这种标注主观性将影响到用于训练的伪标签的质量，最终降低训练得到的语义分割网络的精度。
+\par
+（2）\textbf{边缘先验的缺失}：
+大多数情况下，标注者都会选择在目标的中心区域画线，而不会仔细刻画出目标的轮廓（否则就失去了涂鸦线作为弱标签的低成本优势）。
+此时，单纯从涂鸦线标签无法直接获得目标的边缘先验，只能获知目标中心大致有哪些像素，却不知道这些像素的边界在哪里。
+相比之下，框标签虽然也没有直接刻画目标的精确轮廓，但对归属于目标的像素点做了范围限制，一定程度上比线标签更有利于定位边缘。
+这种边缘先验的缺失对于边缘检测、语义分割、实例分割等像素级任务较为不利，通常要求模型设计额外的模块（如 CRF\cite{krahenbuhl2011efficient}）来补全边缘信息。
+\par
+% 难点解决
+为了解决以上这些问题，本章节以涂鸦线标签为研究对象，设计了一种新的基于图相似度传播的弱监督语义分割框架 GAP-CAM。
+该框架首先设计了一种基于视觉注意力图的伪标签初始化策略，借助于分类标签不随标注者而变化的特点，规避了线标签的主观性对于模型性能的影响；然后，基于超像素与图卷积算子设计了一个区域相似度建模网络，最后
+\section{基于图相似度传播的自然图像弱监督分割框架 GAP-CAM}
+\begin{figure}[h]
+\centering
+\includegraphics[width=\linewidth]{gapcam-arch}
+\caption{基于图相似度传播的弱监督语义分割框架 GAP-CAM}
+\label{fig:gapcam-arch}
+\end{figure}
+% 对框架 GAP-CAM 的一段话介绍
+GAP-CAM（\textbf{G}raph \textbf{A}ffinity \textbf{P}ropagation - \textbf{C}lass \textbf{A}ctivation \textbf{M}ap）
+\subsection{基于视觉注意力图的伪标签初始化策略}
+\label{subsec:cam}
+直观来看，一个图像分类网络使用类别标签进行训练，输出不带空间信息的类别概率向量，理论上无法提供任何关于目标位置或目标大小的额外信息。
+随着神经网络可解释性领域的发展，研究者指出，分类网络对目标在空间中的位置有相当的感知能力，从面向分类的卷积神经网络中提取出目标的粗略定位信息是可行的，能够用于解释其分类结果\cite{oquab2015object}。
+亦即，通过一定的结构设计，我们能够用图像级的类别标签训练出具有定位能力的神经网络。
+这启示我们，针对涂鸦线监督的语义分割，可以先将涂鸦线标签转换为完备的类别标签，训练得到分类网络，提取网络中蕴涵的目标位置信息，用于辅助弱监督学习中伪标签的初始化，为后续分割网络的训练作好准备。
+\par
+目前，针对图像分类模型在目标定位方面的研究主要分为两大分支：显著性图（saliency map）与类激活图（CAM，class activation map）。
+如\figureref{fig:saliency-cam}所示，两者都能被解释为模型对于输入图像属于某个类别的判断依据。
+\subfigureref{subfig:saliency-cam-saliency}是显著性图，本质上就是分类输出关于输入图像的梯度图，其每个像素值等于分类置信度对输入图像像素的一阶导数值，反映了输入图像中该像素发生微小变化时，会对分类结果产生多大程度的影响\cite{simonyan2013deep}。
+\subfigureref{subfig:saliency-cam-cam}是类激活图，将全连接层的权重解释为卷积层特征图对于输出类别的贡献大小，以特征图加权求和的形式作为像素重要性表征\cite{zhou2016learning}。
+视觉效果上，类激活图就像画出了人类在观察一幅图像时聚焦注意力的区域，所以又被称为视觉注意力图。
+鉴于视觉注意力图会生成更少的噪点和更平滑的边缘，相比显著性图更适合于像素级分割任务，所以本文使用视觉注意力图作为伪标签的初始化依据。
+\par
+\begin{figure}[h]
+\centering
+\subfloat[输入图像]{\includegraphics[width=.3\linewidth]{sample-4}%
+\label{subfig:saliency-cam-input}}
+\hfil
+\subfloat[显著性图]{\includegraphics[width=.3\linewidth]{saliency-4}%
+\label{subfig:saliency-cam-saliency}}
+\hfil
+\subfloat[类激活图]{\includegraphics[width=.3\linewidth]{cam-4}%
+\label{subfig:saliency-cam-cam}}
+\caption{显著性图与类激活图示例}
+\label{fig:saliency-cam}
+\end{figure}
+\par
+视觉注意力图的实现原理如\figureref{fig:cam-vgg16}所示。
+% 分类网络结构
+这一解释性图依赖于特定的分类网络结构：由卷积神经网络提取特征，由全局平均池化层\cite{lin2013network}降低维度，由单个全连接层判定类别。
+具体而言，假设共 $n$ 个类别，对于输入图像，首先经由卷积神经网络提取得到最后一层 $m$ 个特征图 $F_1, F_2, \dots, F_m \in \mathcal{R}^{h \times w}$；
+接着如\equationref{eqn:gap}所示，经由全局平均池化层将 $m$ 个特征图映射为 $m$ 个标量 $f_1, f_2, \dots, f_m \in \mathcal{R}$；
+最后如\equationref{eqn:fc}所示，使用带 Softmax 的全连接层输出概率向量 $y \in [0,1]^{n}$ 作为分类结果，学习第 $k$ 个标量对第 $c$ 个类别的权重 $w_{k,c}$，对应第 $k$ 个特征图对第 $c$ 个置信度的重要程度：
+\begin{equation}
+f_k = \frac{\sum_i^w \sum_j^h F_k(i,j)}{h \times w}
+\label{eqn:gap}
+\end{equation}
+\begin{equation}
+y_c = \frac{\exp(\sum_k^m w_{k,c} f_k)}{\sum_c^n \exp(\sum_k^m w_{k,c} f_k)}
+\label{eqn:fc}
+\end{equation}
+\par
+在此基础上，假设分类标签集合 $\mathcal{C}$ 指示出图像中存在第 $c$ 个类别，即 $c \in \mathcal{C}$，则这个类别的视觉注意力图 $\text{CAM}_c$ 被定义为最后一层特征图的加权求和图，此加权系数为全连接层中各特征图对第 $c$ 个置信度的权重 $w_{1,c}, w_{2,c}, \dots, w_{m,c}$：
+\begin{equation}
+\text{CAM}_c(i,j) = \sum_k^m w_{k,c} F_k(i,j)
+\label{eqn:cam}
+\end{equation}
+再经 ReLU 函数、归一化、上采样等后处理步骤后，就能得到通常意义上如\subfigureref{subfig:saliency-cam-cam}的视觉注意力图了，其尺寸与原图相当，每个像素值非负且落在 $[0,1]$ 内，代表该像素对于分类结果的影响程度大小（越接近 $1$ 表明该像素对于分类结果越重要）。
+% 对于加权求和的理解
+此加权求和特征图被认为是视觉注意力图，可以类比显著性图做如下解释：将最后一层特征图视为卷积神经网络提取到的各种特征，那么这些特征对于分类结果的重要性，可以等价于分类置信度关于这些特征图的梯度。由
+\begin{equation}
+\frac{\partial{y_c}}{\partial{F_k}} = \frac{\partial{y_c}}{\partial{f_k}} \times \frac{\partial{f_k}}{\partial{F_k}} = w_{k,c}
+\end{equation}
+可知，这一梯度正好就等于全连接层的权重。因此，全连接层中各特征图对第 $c$ 个置信度的权重 $w_{1,c}, w_{2,c}, \dots, w_{m,c}$ 就可以被认为是这些特征图对于分类结果的重要程度，也就能够作为\equationref{eqn:cam}中加权求和的系数项了。
+\par
+\begin{figure}[h]
+\centering
+\includegraphics[width=\linewidth]{cam-vgg16}
+\caption{视觉注意力图的实现原理}
+\label{fig:cam-vgg16}
+\end{figure}
+% Grad-CAM
+\par
+视觉注意力图 CAM，及其衍生的 Grad-CAM、Grad-CAM++ 等算法，可以被认为开创了弱监督语义分割这一领域的研究。
+现代
+已成为现有弱监督算法的常规做法
+\par
+\begin{figure}[h]
+\centering
+\includegraphics[width=\linewidth]{cam-frame}
+\caption{}
+\label{fig:cam-frame}
+\end{figure}
+\par
+图片中出现多少个类别的目标，就能生成多少张激活图
+线标签一张图，每根线指向不同注意力图，共四张图
 \subsection{基于超像素图卷积的区域相似度建模网络}
-超像素生成算法 SLIC
+为了提前将输入图像划分为多个子区域，便于后续对不同区域间的相似度进行建模，我们使用无需训练样本的无监督算法 SLIC（Simple Linear Iterative Clustering）将输入图像切割为多个不规则超像素的集合 $\{ R_1, R_2, \dots, R_{n^\text{superpix}} \}$。
+这里，$R_i = \{ (x_1,y_1), (x_2,y_2), \dots \}$ 是由不定数量的像素组成的超像素，$n^\text{superpix}$ 为人为设定的超像素数量\cite{}。
+该算法本质上是一种 K-means 聚类\cite{}，通过不断迭代的方式更新聚类中心。
+在每轮迭代中，对每个像素都度量其与相邻聚类中心的距离，该距离同时考虑了空间位置与 CIELAB 颜色空间，使得离中心越远、与中心的颜色差距越大的像素具有更大的距离值。
+这样一来，相近且相似的像素就会被分到同一个超像素中。
+关于已有算法 SLIC 的其他细节，本节不再赘述。
 \par
-图卷积网络，区域相似度网络
+以输入图像为基点构建图结构，可以将这些孤立的超像素串联成为拓扑结构，使得挖掘超像素自身特征与超像素间的关联成为可能。
+三通道的彩色输入图像，可以被视为以像素为节点、以像素值间的大小差距为边的二维网格图。
+类似地，这里所构建的是以超像素为节点、以超像素间特征差异为边的不规则图结构。
+形式化地说，在 SLIC 的基础上，我们构建一张超像素图 $\mathcal{G}^\text{superpix} = \{ \mathcal{V}, \mathcal{E}, \mathbf{X}, \mathbf{A} \}$。
+其中，$\mathcal{V} = \{ R_1, R_2, \dots, R_{n^\text{superpix}} \}$ 是超像素节点集合。
+$\mathcal{E}$ 是超像素边集合，用于定性地描述两个超像素的相邻关系，$(R_i, R_j) \in \mathcal{E}$ 表示两个超像素 $R_i$ 和 $R_j$ 在原始输入图像中是相邻的。
+$\mathbf{X}$ 是超像素节点的特征矩阵，其每一行 $\mathbf{X}_i$ 是对应于超像素 $R_i$ 的特征向量，表征为该超像素内所有像素值的平均值（对于三通道彩色图像，各通道分别求均值）：
+\begin{equation}
+\mathbf{X}_i = \frac{1}{n^\text{pix}_i} \sum_{(x,y) \in R_i} I(x,y) 
+\end{equation}
+这里 $n^\text{pix}_i$ 表示该超像素 $R_i$ 所包含的像素数目。
+$\mathbf{A}$ 是图的邻接矩阵，用于定量地描述两个超像素之间的相似度。
+该矩阵中每个元素 $\mathbf{A}_{i,j}$ 被表征为两个方面，一是两个超像素的像素均值的差异，该差异越大说明两个超像素的整体颜色越不接近；二是两个超像素中最远的一对像素之间的距离，该距离越大说明两个超像素离得越远：
+\begin{equation}
+\mathbf{A}_{i,j} =
+\begin{cases}
+    \cfrac{\vert \mathbf{X}_i - \mathbf{X}_j \vert}{256} + \cfrac{\max\limits_{(x_i,y_i) \in R_i,(x_j,y_j) \in R_j}\sqrt{(x_i - x_j)^2 + (y_i - y_j)^2}}{\sqrt{h^2 + w^2}},&\text{if } (R_i, R_j) \in \mathcal{E} \\
+    0,&\text{otherwise}
+\end{cases}
+\end{equation}
+这里仅当 $(R_i, R_j) \in \mathcal{E}$ 也就是两个超像素在原始图像中相邻时，其邻接矩阵值才非零，进而将超像素是否相邻的信息也编码在了邻接矩阵中。
 \par
-视觉注意力图 \rightarrow 区域相似度标签，相似度损失
+将包含几万个像素点的二维图像转化为包含几百个超像素的拓扑图结构后，下一步是衡量不同区域的特征相似度，进而可以基于这些相似度来扩张初始的伪标签。
+对于 $n^\text{superpix}$ 个超像素，两两超像素间的相似度共有 $C_{n^\text{superpix}}^2 = n^\text{superpix}(n^\text{superpix}-1)$ 种组合。
+出于计算效率和图不规则性的考虑，我们使用一个图卷积网络来挖掘各个超像素的视觉特征。
+该网络不直接输出每两个超像素之间的相似度大小，而是输出一张拓扑结构与输入图相同的特征图 $\mathcal{G}^\text{aff}$，其每个节点都是对应于单个超像素的一个 256 维的特征向量 $\mathbf{Y}_i \in \mathcal{R}^{256}$，而超像素 $R_i$ 与 $R_j$ 之间的语义相似度 $\mathbf{F}_{i,j}$ 就可以被定义为它们特征向量的 L1 距离：
+\begin{equation}
+\mathbf{F}_{i,j} = \exp\left(- \Vert \mathbf{Y}_i - \mathbf{Y}_j \Vert_1\right)
+\label{eqn:gcn-sim}
+\end{equation}
+这样，只需将图像输入图卷积网络中，执行一次前向推理，就能得到所有超像素的高级语义特征 $\mathbf{Y}_1, \mathbf{Y}_2, \dots, \mathbf{Y}_{n^\text{superpix}}$，进而能够计算所有超像素间的语义相似度了。
+具体而言，该图卷积网络共由三层图卷积算子构成，各层图卷积都带有 ReLU 激活函数，分别输出 64、128、256 个通道的特征图。
+\par
+在该图卷积网络的结构设计基础上，剩下的问题是如何提供标签以训练该网络。
+出于其设计初衷，这些训练标签应该能够可信地描述图像中区域间的相似度。
+考虑\sectionref{subsec:cam}中引入的视觉注意力图，它解释了“是哪些像素使得模型认为图像属于该类别”。
+换句话说，对于出现在图像中的类别 $c \in \mathcal{C}$，视觉注意力图 $\text{CAM}_c$ 能够粗略指出哪些像素的语义特征与类别 $c$ 较为接近。
+此时，由同一张视觉注意力图所指出的像素之间应具有较高的特征相似度，由不同视觉注意力图所指出的像素之间应具有较低的特征相似度。
+这启示我们，视觉注意力图就是用于训练上述图卷积网络的最佳标签来源，对视觉注意力图稍加处理后，就能构造出有效的区域样本对。
+\par
+首先，由于\equationref{eqn:cam}所给出的视觉注意力图定义只适用于前景类别 $c$，不适用于背景，而超像素区域既可能是前景也可能是背景，所以我们首先定义出背景的视觉注意力图 $\text{CAM}_\text{bg}$。
+它是前景视觉注意力图的残差：
+\begin{equation}
+\text{CAM}_\text{bg}(x,y) = 1 - \max_{c \in \mathcal{C}} \text{CAM}_c(x,y) \in [0,1]
+\end{equation}
+对于像素 $(x,y)$，若它属于某个前景类别 $c$，则该类视觉注意力图的数值 $\text{CAM}_c(x,y)$ 较接近于 $1$，导致 $\text{CAM}_\text{bg}(x,y)$ 较接近于 $0$，表明该像素越不可能是背景；
+若它不属于任何前景类别，则所有类的视觉注意力图的数值都较小，导致 $\text{CAM}_\text{bg}(x,y)$ 较接近于 $1$，表明该像素越有可能是背景。
+在所有类别（包括背景）视觉注意力图的基础上，可以将输入图像中的所有像素按类别划分成一个个的集合 $\mathcal{P}_1, \mathcal{P}_2, \dots, \mathcal{P}_{n^\text{class}}$：
+\begin{equation}
+\mathcal{P}_c = \left\{ (x,y)\ \vert\ c = \arg\max_{ c \in \mathcal{C} \cup \{ \text{bg} \}} \text{CAM}_c(x,y)\ \ \text{and}\ \ \text{CAM}_c(x,y) > \alpha \right\}
+\end{equation}
+某个像素要成为这个集合中的一员，要求该类的视觉注意力图在此处的值不仅是所有类别中的最大值，还要超过某个提前设定的阈值 $\alpha$。
+前者保证了单个像素不会同时属于多个不同类别的集合，后者对视觉注意力图的输出值做了一次筛选，尽可能令集合中的像素都是可信像素。
+\par
+有了这些可信像素集合后，我们就可以判定超像素图 $\mathcal{G}^\text{superpix}$ 中每个超像素的所属类别了：规定，当超像素 $R_i$ 中有超过 50\% 的像素属于某个集合 $\mathcal{P}_c$ 时，我们称“超像素 $R_i$ 属于类别 $c$”，记为 $F^{*}_i = c$，即
+\begin{equation}
+F^{*}_i = c
+\iff
+c = \arg\max\limits_c \vert R_i \cap \mathcal{P}_c \vert\ \ \text{and}\ \ \max\limits_c \vert R_i \cap \mathcal{P}_c \vert > 50\% \times \vert R_i \vert
+\end{equation}
+否则“超像素 $R_i$ 不属于任何类别”，记为 $F^{*}_i = \infty$。
+对于两个超像素 $R_i$ 和 $R_j$，其相似度分三种情况讨论：
+若它们相邻，且按上述规定同属于一个类别，那么理应认为它们具有较高的语义相似度；
+若它们相邻，且虽然都有所属类别，但所属类别不一致，那么理应认为它们具有较低的语义相似度；
+若它们不相邻，或者有某一方不属于任何类别，那么该超像素并不是主要由可信的像素所组成的，此时不赋予相似度标签，这一对超像素不参与训练：
+\begin{equation}
+\mathbf{F}^{*}_{i,j} =
+\begin{cases}
+1,&\text{if}\ \ (i,j) \in \mathcal{E}\ \ \text{and}\ \ F^{*}_i \neq \infty\ \ \text{and}\ \ F^{*}_j \neq \infty\ \ \text{and}\ \ F^{*}_i = F^{*}_j\\
+0,&\text{if}\ \ (i,j) \in \mathcal{E}\ \ \text{and}\ \ F^{*}_i \neq \infty\ \ \text{and}\ \ F^{*}_j \neq \infty\ \ \text{and}\ \ F^{*}_i \neq F^{*}_j\\
+\text{无意义},&\text{else}
+\end{cases}
+\end{equation}
+\par
+以 $\mathbf{F}^{*}_{i,j}$ 为任意两个超像素间的相似度标签，结合\equationref{eqn:gcn-sim}的输出 $\mathbf{F}_{i,j}$ 作为网络的预测结果，图卷积网络就可以进行训练了。
+由于 $\mathbf{F}_{i,j} \in [0,1]$ 而 $\mathbf{F}^{*}_{i,j} \in \{0,1\}$，与二分类的情况一致，所以我们可以选择二元交叉熵损失作为监督损失。
+另外，考虑到 $\mathbf{F}^{*}_{i,j} = 0$ 的情况远多于 $\mathbf{F}^{*}_{i,j} = 1$（任取两个超像素，它们属于不同类别的概率，远大于它们同属于一个类别的概率），因此我们将损失函数拆分为独立的两项，并进行归一化以平衡这两种情况：
+\begin{align}
+\mathcal{L}^{+} &= -\frac{1}{\vert \{ (i,j) \vert \mathbf{F}^{*}_{i,j} = 1 \} \vert} \sum_{i,j}^{\mathbf{F}^{*}_{i,j} = 1} \log \mathbf{F}_{i,j}\\
+\mathcal{L}^{-} &= -\frac{1}{\vert \{ (i,j) \vert \mathbf{F}^{*}_{i,j} = 0 \} \vert} \sum_{i,j}^{\mathbf{F}^{*}_{i,j} = 0} \log (1 - \mathbf{F}_{i,j})\\
+\mathcal{L} &= \mathcal{L}^{+} + \mathcal{L}^{-}
+\end{align}
 \subsection{基于随机游走的涂鸦线伪标签扩张算法}
 涂鸦线 \rightarrow 多个超像素
 \par
 随机游走
+\par
+交叉熵
 \section{实验结果与分析}
+本节做了什么。
+\par
+实验设置，实验环境。
+\par
+指标
 \subsection{自然图像语义分割数据集 PASCAL VOC}
 \subsection{与其他弱监督语义分割算法的比较}
 \subsection{针对 GAP-CAM 的消融实验}
 \subsection{针对 GAP-CAM 的超参数敏感性分析}
 \section{本章小结}
+一段话。
